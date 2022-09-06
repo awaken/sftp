@@ -37,7 +37,7 @@ func (cs csPair) testHandler() *root {
 
 const sock = "/tmp/rstest.sock"
 
-func clientRequestServerPair(t *testing.T) *csPair {
+func clientRequestServerPairWithHandlers(t *testing.T, handlers Handlers, options ...RequestServerOption) *csPair {
 	skipIfWindows(t)
 	skipIfPlan9(t)
 
@@ -61,8 +61,6 @@ func clientRequestServerPair(t *testing.T) *csPair {
 		fd, err := l.Accept()
 		require.NoError(t, err)
 
-		handlers := InMemHandler()
-		var options []RequestServerOption
 		if *testAllocator {
 			options = append(options, WithRSAllocator())
 		}
@@ -89,6 +87,10 @@ func clientRequestServerPair(t *testing.T) *csPair {
 	pair.svr = server
 	pair.cli = client
 	return pair
+}
+
+func clientRequestServerPair(t *testing.T, options ...RequestServerOption) *csPair {
+	return clientRequestServerPairWithHandlers(t, InMemHandler(), options...)
 }
 
 func checkRequestServerAllocator(t *testing.T, p *csPair) {
@@ -781,6 +783,37 @@ func TestRequestStatVFSError(t *testing.T) {
 	checkRequestServerAllocator(t, p)
 }
 
+func TestRequestStartDirOption(t *testing.T) {
+	startDir := "/start/dir"
+	p := clientRequestServerPair(t, WithStartDirectory(startDir))
+	defer p.Close()
+
+	// create the start directory
+	err := p.cli.MkdirAll(startDir)
+	require.NoError(t, err)
+	// the working directory must be the defined start directory
+	wd, err := p.cli.Getwd()
+	require.NoError(t, err)
+	require.Equal(t, startDir, wd)
+	// upload a file using a relative path, it must be uploaded to the start directory
+	fileName := "file.txt"
+	_, err = putTestFile(p.cli, fileName, "")
+	require.NoError(t, err)
+	// we must be able to stat the file using both a relative and an absolute path
+	for _, filePath := range []string{fileName, path.Join(startDir, fileName)} {
+		fi, err := p.cli.Stat(filePath)
+		require.NoError(t, err)
+		assert.Equal(t, fileName, fi.Name())
+	}
+	// list dir contents using a relative path
+	entries, err := p.cli.ReadDir(".")
+	assert.NoError(t, err)
+	assert.Len(t, entries, 1)
+	// delete the file using a relative path
+	err = p.cli.Remove(fileName)
+	assert.NoError(t, err)
+}
+
 func TestCleanDisconnect(t *testing.T) {
 	p := clientRequestServerPair(t)
 	defer p.Close()
@@ -810,27 +843,102 @@ func TestUncleanDisconnect(t *testing.T) {
 }
 
 func TestRealPath(t *testing.T) {
-	root := &root{
-		rootFile:       &memFile{name: "/", modtime: time.Now(), isdir: true},
-		files:          make(map[string]*memFile),
-		startDirectory: "/apath",
-	}
+	startDir := "/startdir"
+	// the default InMemHandler does not implement the RealPathFileLister interface
+	// so we are using the builtin implementation here
+	p := clientRequestServerPair(t, WithStartDirectory(startDir))
+	defer p.Close()
 
-	p := root.Realpath(".")
-	assert.Equal(t, root.startDirectory, p)
-	p = root.Realpath("/")
-	assert.Equal(t, "/", p)
-	p = root.Realpath("..")
-	assert.Equal(t, "/", p)
-	p = root.Realpath("../../..")
-	assert.Equal(t, "/", p)
-	p = root.Realpath("relpath")
-	assert.Equal(t, path.Join(root.startDirectory, "relpath"), p)
+	realPath, err := p.cli.RealPath(".")
+	require.NoError(t, err)
+	assert.Equal(t, startDir, realPath)
+	realPath, err = p.cli.RealPath("/")
+	require.NoError(t, err)
+	assert.Equal(t, "/", realPath)
+	realPath, err = p.cli.RealPath("..")
+	require.NoError(t, err)
+	assert.Equal(t, "/", realPath)
+	realPath, err = p.cli.RealPath("../../..")
+	require.NoError(t, err)
+	assert.Equal(t, "/", realPath)
+	// test a relative path
+	realPath, err = p.cli.RealPath("relpath")
+	require.NoError(t, err)
+	assert.Equal(t, path.Join(startDir, "relpath"), realPath)
+}
+
+// In memory file-system which implements RealPathFileLister
+type rootWithRealPather struct {
+	root
+}
+
+// implements RealpathFileLister interface
+func (fs *rootWithRealPather) RealPath(p string) (string, error) {
+	if fs.mockErr != nil {
+		return "", fs.mockErr
+	}
+	return cleanPath(p), nil
+}
+
+func TestRealPathFileLister(t *testing.T) {
+	root := &rootWithRealPather{
+		root: root{
+			rootFile: &memFile{name: "/", modtime: time.Now(), isdir: true},
+			files:    make(map[string]*memFile),
+		},
+	}
+	handlers := Handlers{root, root, root, root}
+	p := clientRequestServerPairWithHandlers(t, handlers)
+	defer p.Close()
+
+	realPath, err := p.cli.RealPath(".")
+	require.NoError(t, err)
+	assert.Equal(t, "/", realPath)
+	realPath, err = p.cli.RealPath("relpath")
+	require.NoError(t, err)
+	assert.Equal(t, "/relpath", realPath)
+	// test an error
+	root.returnErr(ErrSSHFxPermissionDenied)
+	_, err = p.cli.RealPath("/")
+	require.ErrorIs(t, err, os.ErrPermission)
+}
+
+// In memory file-system which implements legacyRealPathFileLister
+type rootWithLegacyRealPather struct {
+	root
+}
+
+// implements RealpathFileLister interface
+func (fs *rootWithLegacyRealPather) RealPath(p string) string {
+	return cleanPath(p)
+}
+
+func TestLegacyRealPathFileLister(t *testing.T) {
+	root := &rootWithLegacyRealPather{
+		root: root{
+			rootFile: &memFile{name: "/", modtime: time.Now(), isdir: true},
+			files:    make(map[string]*memFile),
+		},
+	}
+	handlers := Handlers{root, root, root, root}
+	p := clientRequestServerPairWithHandlers(t, handlers)
+	defer p.Close()
+
+	realPath, err := p.cli.RealPath(".")
+	require.NoError(t, err)
+	assert.Equal(t, "/", realPath)
+	realPath, err = p.cli.RealPath("..")
+	require.NoError(t, err)
+	assert.Equal(t, "/", realPath)
+	realPath, err = p.cli.RealPath("relpath")
+	require.NoError(t, err)
+	assert.Equal(t, "/relpath", realPath)
 }
 
 func TestCleanPath(t *testing.T) {
 	assert.Equal(t, "/", cleanPath("/"))
 	assert.Equal(t, "/", cleanPath("."))
+	assert.Equal(t, "/", cleanPath(""))
 	assert.Equal(t, "/", cleanPath("/."))
 	assert.Equal(t, "/", cleanPath("/a/.."))
 	assert.Equal(t, "/a/c", cleanPath("/a/b/../c"))

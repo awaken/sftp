@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
@@ -18,6 +19,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"sync"
@@ -164,7 +166,7 @@ func netPipe(t testing.TB) (io.ReadWriteCloser, io.ReadWriteCloser) {
 	return c1, r.Conn
 }
 
-func testClientGoSvr(t testing.TB, readonly bool, delay time.Duration) (*Client, *exec.Cmd) {
+func testClientGoSvr(t testing.TB, readonly bool, delay time.Duration, opts ...ClientOption) (*Client, *exec.Cmd) {
 	c1, c2 := netPipe(t)
 
 	options := []ServerOption{WithDebug(os.Stderr)}
@@ -183,7 +185,7 @@ func testClientGoSvr(t testing.TB, readonly bool, delay time.Duration) (*Client,
 		wr = newDelayedWriter(wr, delay)
 	}
 
-	client, err := NewClientPipe(c2, wr)
+	client, err := NewClientPipe(c2, wr, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,13 +196,13 @@ func testClientGoSvr(t testing.TB, readonly bool, delay time.Duration) (*Client,
 
 // testClient returns a *Client connected to a locally running sftp-server
 // the *exec.Cmd returned must be defer Wait'd.
-func testClient(t testing.TB, readonly bool, delay time.Duration) (*Client, *exec.Cmd) {
+func testClient(t testing.TB, readonly bool, delay time.Duration, opts ...ClientOption) (*Client, *exec.Cmd) {
 	if !*testIntegration {
 		t.Skip("skipping integration test")
 	}
 
 	if *testServerImpl {
-		return testClientGoSvr(t, readonly, delay)
+		return testClientGoSvr(t, readonly, delay, opts...)
 	}
 
 	cmd := exec.Command(*testSftp, "-e", "-R", "-l", debuglevel) // log to stderr, read only
@@ -228,7 +230,7 @@ func testClient(t testing.TB, readonly bool, delay time.Duration) (*Client, *exe
 		t.Skipf("could not start sftp-server process: %v", err)
 	}
 
-	sftp, err := NewClientPipe(pr, pw)
+	sftp, err := NewClientPipe(pr, pw, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +360,7 @@ func TestClientOpenIsNotExist(t *testing.T) {
 	defer cmd.Wait()
 	defer sftp.Close()
 
-	if _, err := sftp.Open("/doesnt/exist/"); !os.IsNotExist(err) {
+	if _, err := sftp.Open("/doesnt/exist"); !os.IsNotExist(err) {
 		t.Errorf("os.IsNotExist(%v) = false, want true", err)
 	}
 }
@@ -368,7 +370,7 @@ func TestClientStatIsNotExist(t *testing.T) {
 	defer cmd.Wait()
 	defer sftp.Close()
 
-	if _, err := sftp.Stat("/doesnt/exist/"); !os.IsNotExist(err) {
+	if _, err := sftp.Stat("/doesnt/exist"); !os.IsNotExist(err) {
 		t.Errorf("os.IsNotExist(%v) = false, want true", err)
 	}
 }
@@ -757,6 +759,11 @@ func TestClientGetwd(t *testing.T) {
 }
 
 func TestClientReadLink(t *testing.T) {
+	if runtime.GOOS == "windows" && *testServerImpl {
+		// os.Symlink requires privilege escalation.
+		t.Skip()
+	}
+
 	sftp, cmd := testClient(t, READWRITE, NODELAY)
 	defer cmd.Wait()
 	defer sftp.Close()
@@ -809,6 +816,11 @@ func TestClientLink(t *testing.T) {
 }
 
 func TestClientSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" && *testServerImpl {
+		// os.Symlink requires privilege escalation.
+		t.Skip()
+	}
+
 	sftp, cmd := testClient(t, READWRITE, NODELAY)
 	defer cmd.Wait()
 	defer sftp.Close()
@@ -1202,7 +1214,7 @@ func TestClientReadSequential(t *testing.T) {
 
 		stuff := make([]byte, 32)
 		n, err := sftpFile.Read(stuff)
-		require.NoError(t, err)
+		require.ErrorIs(t, err, io.EOF)
 		require.Equal(t, len(content), n)
 		require.Equal(t, content, stuff[0:len(content)])
 
@@ -1235,6 +1247,53 @@ func TestClientReadSequential(t *testing.T) {
 		err = sftpFile.Close()
 		require.NoError(t, err)
 	}
+}
+
+// this writer requires maxPacket = 3 and always returns an error for the second write call
+type lastChunkErrSequentialWriter struct {
+	counter int
+}
+
+func (w *lastChunkErrSequentialWriter) Write(b []byte) (int, error) {
+	w.counter++
+	if w.counter == 1 {
+		if len(b) != 3 {
+			return 0, errors.New("this writer requires maxPacket = 3, please set MaxPacketChecked(3)")
+		}
+		return len(b), nil
+	}
+	return 1, errors.New("this writer fails after the first write")
+}
+
+func TestClientWriteSequentialWriterErr(t *testing.T) {
+	client, cmd := testClient(t, READONLY, NODELAY, MaxPacketChecked(3))
+	defer cmd.Wait()
+	defer client.Close()
+
+	d, err := ioutil.TempDir("", "sftptest-writesequential-writeerr")
+	require.NoError(t, err)
+
+	defer os.RemoveAll(d)
+
+	f, err := ioutil.TempFile(d, "write-sequential-writeerr-test")
+	require.NoError(t, err)
+	fname := f.Name()
+	_, err = f.Write([]byte("12345"))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	sftpFile, err := client.Open(fname)
+	require.NoError(t, err)
+	defer sftpFile.Close()
+
+	w := &lastChunkErrSequentialWriter{}
+	written, err := sftpFile.writeToSequential(w)
+	assert.Error(t, err)
+	expected := int64(4)
+	if written != expected {
+		t.Errorf("sftpFile.Write() = %d, but expected %d", written, expected)
+	}
+	assert.Equal(t, 2, w.counter)
 }
 
 func TestClientReadDir(t *testing.T) {
@@ -1489,6 +1548,59 @@ func TestClientReadFrom(t *testing.T) {
 	}
 }
 
+// A sizedReader is a Reader with a completely arbitrary Size.
+type sizedReader struct {
+	io.Reader
+	size int
+}
+
+func (r *sizedReader) Size() int { return r.size }
+
+// Test File.ReadFrom's handling of a Reader's Size:
+// it should be used as a heuristic for determining concurrency only.
+func TestClientReadFromSizeMismatch(t *testing.T) {
+	const (
+		packetSize = 1024
+		filesize   = 4 * packetSize
+	)
+
+	sftp, cmd := testClient(t, READWRITE, NODELAY, MaxPacketChecked(packetSize), UseConcurrentWrites(true))
+	defer cmd.Wait()
+	defer sftp.Close()
+
+	d, err := ioutil.TempDir("", "sftptest-readfrom-size-mismatch")
+	if err != nil {
+		t.Fatal("cannot create temp dir:", err)
+	}
+	defer os.RemoveAll(d)
+
+	buf := make([]byte, filesize)
+
+	for i, reportedSize := range []int{
+		-1, filesize - 100, filesize, filesize + 100,
+	} {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			r := &sizedReader{Reader: bytes.NewReader(buf), size: reportedSize}
+
+			f := path.Join(d, fmt.Sprint(i))
+			w, err := sftp.Create(f)
+			if err != nil {
+				t.Fatal("unexpected error:", err)
+			}
+			defer w.Close()
+
+			n, err := w.ReadFrom(r)
+			assert.EqualValues(t, filesize, n)
+
+			fi, err := os.Stat(f)
+			if err != nil {
+				t.Fatal("unexpected error:", err)
+			}
+			assert.EqualValues(t, filesize, fi.Size())
+		})
+	}
+}
+
 // Issue #145 in github
 // Deadlock in ReadFrom when network drops after 1 good packet.
 // Deadlock would occur anytime desiredInFlight-inFlight==2 and 2 errors
@@ -1546,6 +1658,7 @@ func clientWriteDeadlock(t *testing.T, N int, badfunc func(*File)) {
 	if !*testServerImpl {
 		t.Skipf("skipping without -testserver")
 	}
+
 	sftp, cmd := testClient(t, READWRITE, NODELAY)
 	defer cmd.Wait()
 	defer sftp.Close()
@@ -2187,18 +2300,23 @@ func TestServerRoughDisconnectEOF(t *testing.T) {
 // sftp/issue/26 writing to a read only file caused client to loop.
 func TestClientWriteToROFile(t *testing.T) {
 	skipIfWindows(t)
+
 	sftp, cmd := testClient(t, READWRITE, NODELAY)
 	defer cmd.Wait()
+
 	defer func() {
 		err := sftp.Close()
 		assert.NoError(t, err)
 	}()
 
+	// TODO (puellanivis): /dev/zero is not actually a read-only file.
+	// So, this test works purely by accident.
 	f, err := sftp.Open("/dev/zero")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
+
 	_, err = f.Write([]byte("hello"))
 	if err == nil {
 		t.Fatal("expected error, got", err)
